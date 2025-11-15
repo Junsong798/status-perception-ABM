@@ -1,0 +1,350 @@
+---
+title: "large_coalition_invasion"
+output: html_document
+date: "2025-07-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r coalition valuation public goods game with WTR included}
+
+# coalitionary_status_invasion.R
+
+# 0) Libraries
+library(parallel)
+library(dplyr)
+
+# 1) Parameter grid
+C_grid        <- c(3, 5, 10)        # coalition sizes
+k_grid        <- c(1, 2, 5, 10, 20) # status samples
+sigma_grid    <- c(0.1, 0.5, 1.0)   # noise
+gamma_grid    <- c(5, 20, 50)       # stakes
+c_per_sample  <- 0.001
+base_cost     <- 0.001
+
+param_coal <- expand.grid(
+  N            = 100,
+  C            = C_grid,
+  k            = k_grid,
+  sigma_status = sigma_grid,
+  gamma        = gamma_grid,
+  alpha_update = 0.1,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    cost_form   = base_cost,
+    cost_wtr    = base_cost * 2,            # you can tune this
+    cost_stat   = c_per_sample * k,
+    sigma       = sigma_status / sqrt(k)    # effective noise
+  ) %>%
+  mutate(idx = row_number())
+
+# 2) Core simulation: one “generation” of partner-choice + public goods / conflict
+run_coalition_generation <- function(
+  pop_strat,   # vector of length N: "none","form","wtr","stat"
+  s,           # intrinsic strengths
+  WTR,         # N×N direct tie‐matrix
+  C, k, sigma, gamma,
+  cost_form, cost_wtr, cost_stat,
+  alpha_update
+) {
+  N <- length(s)
+  payoffs <- numeric(N)
+
+  # ---- A) Partner-choice: each agent proposes one coalition of size C ----
+  # we maintain a list of proposals: for each agent j, a vector of C agents (including j)
+  proposals <- vector("list", N)
+  for (j in seq_len(N)) {
+    # sample C-1 random others
+    candidates <- sample(setdiff(seq_len(N), j), C-1)
+    # evaluate each candidate set by your strategy
+    evaluate_coalition <- function(members) {
+      if (pop_strat[j]=="form") {
+        return(mean(s[members]))                   # avg strength
+      } else if (pop_strat[j]=="wtr") {
+        return(mean(WTR[j, members]))              # avg direct tie
+      } else if (pop_strat[j]=="stat") {
+        S_est <- rowMeans(WTR)                     # pooled status
+        noisy <- S_est[members] + rnorm(C-1, 0, sigma)
+        return(mean(noisy))
+      } else { # none
+        return(runif(1))
+      }
+    }
+    # score the single candidate group (for more realism, you could sample multiple candidate groups and pick best)
+    proposals[[j]] <- c(j, candidates)
+  }
+
+  # ---- B) Form actual coalitions by mutual proposals ----
+  # simplistic rule: group agents by identical proposal vectors
+  coalition_ids <- rep(NA, N)
+  next_id <- 1
+  for (j in seq_len(N)) {
+    if (is.na(coalition_ids[j])) {
+      grp <- sort(proposals[[j]])
+      members <- which(sapply(proposals, function(x) all(sort(x)==grp)))
+      coalition_ids[members] <- next_id
+      next_id <- next_id + 1
+    }
+  }
+  # now each coalition has ID 1:(next_id-1)
+
+  # ---- C) Payoffs: public goods vs. conflict ----
+  # for simplicity: half of the coalitions play PG, the other half fight
+  coal_ids <- unique(coalition_ids)
+  np <- length(coal_ids)
+  fight_coal <- sample(coal_ids, floor(np/2))
+  pg_coal    <- setdiff(coal_ids, fight_coal)
+
+  # 1) Public goods: each member in PG coalition gets
+  #    (sum strengths of coalition) / |coalition|  minus a small cost
+  cost_pg <- 0.1
+  for (cid in pg_coal) {
+    mems <- which(coalition_ids==cid)
+    share <- sum(s[mems]) / length(mems) - cost_pg
+    payoffs[mems] <- payoffs[mems] + share
+  }
+
+  # 2) Conflict: randomly pair up fight_coalitions
+  fight_pairs <- matrix(sample(fight_coal), ncol=2, byrow=TRUE)
+  for (fp in seq_len(nrow(fight_pairs))) {
+    A_c <- fight_pairs[fp,1]; B_c <- fight_pairs[fp,2]
+    memA <- which(coalition_ids==A_c)
+    memB <- which(coalition_ids==B_c)
+    # compute coalitional power: sum(s) + small noise
+    P_A <- sum(s[memA]); P_B <- sum(s[memB])
+    if (runif(1) < P_A/(P_A+P_B)) {
+      # A wins
+      payoffs[memA] <- payoffs[memA] + gamma
+      payoffs[memB] <- payoffs[memB] - gamma
+      winner <- memA; loser <- memB
+    } else {
+      payoffs[memB] <- payoffs[memB] + gamma
+      payoffs[memA] <- payoffs[memA] - gamma
+      winner <- memB; loser <- memA
+    }
+
+    # split within coalition by status
+    S_all <- rowMeans(WTR)
+    totS_A <- sum(S_all[memA]); totS_B <- sum(S_all[memB])
+    for (j in memA) payoffs[j] <- payoffs[j] + gamma * (S_all[j]/totS_A)
+    for (j in memB) payoffs[j] <- payoffs[j] + gamma * (S_all[j]/totS_B)
+  }
+
+  # ---- D) Cognitive costs ----
+  for (j in seq_len(N)) {
+    if (pop_strat[j]=="form")  payoffs[j] <- payoffs[j] - cost_form
+    if (pop_strat[j]=="wtr")   payoffs[j] <- payoffs[j] - cost_wtr
+    if (pop_strat[j]=="stat")  payoffs[j] <- payoffs[j] - cost_stat
+  }
+
+  # ---- E) Reputation update by all non-participants ----
+  # here we treat every agent as a bystander to each fight
+  for (j in seq_len(N)) {
+    for (opp in winner) {
+      WTR[j,opp] <- WTR[j,opp] + alpha_update * (1 - WTR[j,opp])
+    }
+    for (opp in loser) {
+      WTR[j,opp] <- WTR[j,opp] + alpha_update * (0 - WTR[j,opp])
+    }
+  }
+
+  list(payoffs = payoffs, WTR = WTR)
+}
+
+# 3) Invasion‐fitness wrapper
+one_invasion_run_coal <- function(idx, param) {
+  p <- param[idx, ]
+  set.seed(idx)
+  N   <- p$N
+  s   <- runif(N)
+  WTR <- matrix(0.5, N, N); diag(WTR) <- 0
+
+  # init population: e.g. 49% form, 49% wtr, 2% stat
+  pop_strat <- sample(
+    c(rep("form", 49), rep("wtr",49), rep("stat",2)),
+    N, replace=TRUE
+  )
+
+  # run one generation
+  res <- run_coalition_generation(
+    pop_strat, s, WTR,
+    C            = p$C,
+    k            = p$k,
+    sigma        = p$sigma,
+    gamma        = p$gamma,
+    cost_form    = p$cost_form,
+    cost_wtr     = p$cost_wtr,
+    cost_stat    = p$cost_stat,
+    alpha_update = p$alpha_update
+  )
+
+  df       <- data.frame(strat=pop_strat, payoff=res$payoffs)
+  avg_stat <- mean(df$payoff[df$strat=="stat"])
+  avg_wtr  <- mean(df$payoff[df$strat=="wtr"])
+  avg_form <- mean(df$payoff[df$strat=="form"])
+
+  data.frame(
+    idx      = idx,
+    avg_form = avg_form,
+    avg_wtr  = avg_wtr,
+    avg_stat = avg_stat
+  )
+}
+
+# 4) Parallel sweep
+n_reps   <- 5
+cl       <- makeCluster(detectCores()-1)
+clusterEvalQ(cl, library(dplyr))
+clusterExport(cl, c("param_coal","run_coalition_generation","one_invasion_run_coal"))
+
+total    <- nrow(param_coal)*n_reps
+pb       <- txtProgressBar(0, total, style=3)
+cnt      <- 0
+res_list <- vector("list", nrow(param_coal))
+
+for(i in seq_len(nrow(param_coal))) {
+  idxs <- rep(i, n_reps)
+  block <- parLapplyLB(cl, idxs, function(ii) one_invasion_run_coal(ii, param_coal))
+  dfb   <- bind_rows(block) %>%
+    summarise(
+      avg_form = mean(avg_form),
+      avg_wtr  = mean(avg_wtr),
+      avg_stat = mean(avg_stat)
+    )
+  res_list[[i]] <- cbind(
+    param_coal[i,],
+    diff_wtr = dfb$avg_wtr - dfb$avg_form,
+    diff_stat= dfb$avg_stat- dfb$avg_form
+  )
+  cnt <- cnt + n_reps; setTxtProgressBar(pb, cnt)
+}
+
+stopCluster(cl); close(pb)
+
+inv_coal <- bind_rows(res_list)
+
+# 5) Extract ESS for WTR and STAT
+ess_coal <- inv_coal %>%
+  group_by(C, sigma_status, gamma) %>%
+  slice_max(diff_wtr,  n=1, with_ties=FALSE) %>%
+  rename(ess_k_wtr = k, wtr_advantage = diff_wtr) %>%
+  inner_join(
+    inv_coal %>%
+    group_by(C, sigma_status, gamma) %>%
+    slice_max(diff_stat, n=1, with_ties=FALSE) %>%
+    rename(ess_k_stat = k, stat_advantage=diff_stat),
+    by=c("C","sigma_status","gamma")
+  )
+
+print(ess_coal)
+
+ess_coal_clean <- ess_coal %>%
+  dplyr::select(C, sigma_status, gamma,
+         ess_k_wtr, wtr_advantage,
+         ess_k_stat, stat_advantage)
+
+print(ess_coal_clean)
+
+##WTR advantage visual
+
+library(ggplot2)
+
+ggplot(ess_coal_clean, 
+       aes(x = factor(sigma_status), y = factor(gamma), fill = wtr_advantage)) +
+  geom_tile(color = "grey80") +
+  scale_fill_gradient2(
+    low      = "blue", mid = "white", high = "red", midpoint = 0,
+    name = expression(Delta~Fitness[WTR-form])
+  ) +
+  facet_wrap(~ C, ncol = 3, labeller = label_both) +
+  labs(
+    x = expression(sigma~"(noise)"),
+    y = expression(gamma~"(stakes)"),
+    title = "Invasion Advantage of WTR vs. Form, by Coalition Size"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid = element_blank())
+
+##stat advantage visual
+
+ggplot(ess_coal_clean, 
+       aes(x = factor(sigma_status), y = factor(gamma), fill = stat_advantage)) +
+  geom_tile(color = "grey80") +
+  scale_fill_gradient2(
+    low      = "blue", mid = "white", high = "red", midpoint = 0,
+    name = expression(Delta~Fitness[STAT-form])
+  ) +
+  facet_wrap(~ C, ncol = 3, labeller = label_both) +
+  labs(
+    x = expression(sigma~"(noise)"),
+    y = expression(gamma~"(stakes)"),
+    title = "Invasion Advantage of STAT vs. Form, by Coalition Size"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid = element_blank())
+
+##sampling number ESS for STAT
+
+ggplot(ess_coal_clean, 
+       aes(x = factor(sigma_status), y = factor(gamma), fill = ess_k_stat)) +
+  geom_tile(color = "grey80") +
+  scale_fill_viridis_c(name = "ESS k (stat)") +
+  facet_wrap(~ C, ncol = 3, labeller = label_both) +
+  labs(
+    x = expression(sigma~"(noise)"),
+    y = expression(gamma~"(stakes)"),
+    title = "ESS Sampling Level for STAT, by Coalition Size"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid = element_blank())
+
+##overall visual
+
+library(dplyr)
+library(ggplot2)
+
+winner_df <- ess_coal_clean %>%
+  mutate(winner = case_when(
+    stat_advantage > wtr_advantage & stat_advantage > 0 ~ "stat",
+    wtr_advantage  > stat_advantage & wtr_advantage  > 0 ~ "wtr",
+    TRUE                                              ~ "form"
+  ))
+
+ggplot(winner_df,
+       aes(x = factor(sigma_status),
+           y = factor(gamma),
+           fill = winner)) +
+  geom_tile(color = "grey80") +
+  scale_fill_manual(
+    values = c(form = "#AAAAAA", wtr = "#66C2A5", stat = "#FC8D62"),
+    name = "ESS Winner"
+  ) +
+  facet_wrap(~ C, ncol = 3, labeller = label_both) +
+  labs(
+    x = expression(sigma~"(noise)"),
+    y = expression(gamma~"(stakes)"),
+    title = "ESS Strategy: stat vs. wtr vs. form, by Coalition Size"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid = element_blank())
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

@@ -1,0 +1,468 @@
+---
+title: "Sim1_new"
+output: html_document
+date: "2025-08-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r sim 1 new: EV gate + only status trackers join}
+# ============================================================
+# SIM 1B (Status-Exclusive Coalitions, EV gate, one-time costs)
+# ------------------------------------------------------------
+# - Only STATUS+STATUS pairs can coordinate (form cannot propose or join)
+# - Coalition attempt only if EV(coalition) > EV(fallback)
+# - No per-bout cognitive costs; optional one-time machinery costs
+# - Coalition split 50/50 between the two status allies
+# - Fallback is "separate duels vs strongest" with yielding
+# - Progress bar included; small sweep + heatmap at bottom
+# ============================================================
+
+options(stringsAsFactors = FALSE)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+
+# ---------- tiny text progress bar ----------
+.pb_width <- 40
+.tick <- function(k, total) {
+  done <- floor(.pb_width * k / total)
+  cat(sprintf("\r[%-*s] %3.0f%%", .pb_width,
+              paste0(rep("=", done), collapse = ""),
+              100 * k/total))
+  if (k == total) cat("\n")
+}
+
+# ---------- EV helpers ----------
+# Coalition EV for the *pair total* (sum payoff of both allies) for 2v1 vs sk.
+# Win => +gamma total to pair; Lose => each ally yields (-gamma*yield), third gets +gamma.
+ev_coal_pair_sum <- function(si, sj, sk, gamma, yield_factor) {
+  s_pair <- si + sj
+  p_win  <- s_pair / (s_pair + sk)
+  p_win * gamma + (1 - p_win) * (-2 * gamma * yield_factor)
+}
+
+# Baseline EV for the same pair (sum) if they do NOT coordinate.
+# Fallback: "two duels vs the strongest of the trio" with yielding by losers vs strongest.
+baseline_pair_sum <- function(si, sj, sk, gamma, yield_factor) {
+  svec <- c(si, sj, sk)
+  strongest <- which.max(svec)
+  if (strongest == 3L) {
+    # third is strongest -> both allies yield
+    -2 * gamma * yield_factor
+  } else {
+    # one of the pair is strongest -> strongest beats both, partner yields
+    2 * gamma - gamma * yield_factor
+  }
+}
+
+# Execute a 2v1 coalition fight, returning *individual* deltas for (i, j, k)
+# Here both i and j are STATUS. Split is 50/50.
+coalition_fight_SS <- function(si, sj, sk, gamma, yield_factor) {
+  s_pair <- si + sj
+  p_win  <- s_pair / (s_pair + sk)
+  if (runif(1) < p_win) {
+    c(+gamma/2, +gamma/2, -gamma)
+  } else {
+    c(-gamma*yield_factor, -gamma*yield_factor, +gamma)
+  }
+}
+
+# Fallback: two separate duels vs strongest with yielding.
+# NOTE: keep signature (ids, s, fit, gamma, yield_factor)
+separate_duels_vs_strongest <- function(ids, s, fit, gamma, yield_factor) {
+  svec <- s[ids]
+  tpos <- which.max(svec)
+  t_id <- ids[tpos]
+  t_s  <- s[t_id]
+  ch_ids <- ids[-tpos]
+
+  for (c_id in ch_ids) {
+    sc <- s[c_id]
+    p  <- sc / (sc + t_s)
+    if (runif(1) < p) {
+      fit[c_id] <- fit[c_id] + gamma
+      fit[t_id] <- fit[t_id] - gamma
+    } else {
+      fit[c_id] <- fit[c_id] - gamma * yield_factor
+      fit[t_id] <- fit[t_id] + gamma
+    }
+  }
+  fit
+}
+
+# ---------- Single run ----------
+# ============ helpers ============
+.ev_solo <- function(s_i, s_j, gamma, yield_factor) {
+  # EV of fighting j for a single prize vs yielding
+  p_win <- s_i / (s_i + s_j)
+  ev_fight <- p_win * (+gamma) + (1 - p_win) * (-gamma)   # symmetric payoffs for single prize
+  ev_yield <- -gamma * yield_factor
+  list(p_win = p_win, ev_fight = ev_fight, ev_yield = ev_yield)
+}
+
+.ev_coal <- function(s_a, s_b, s_j, gamma, yield_factor) {
+  # Coalition (a,b) vs j for a single prize, split 50/50 if they win
+  p_win <- (s_a + s_b) / (s_a + s_b + s_j)
+  # each ally's EV if they attempt coalition vs yielding alone (half of outcomes)
+  ev_each_fight  <- p_win * (gamma/2) + (1 - p_win) * (-gamma * yield_factor / 2)
+  ev_each_yield  <- -gamma * yield_factor / 2
+  list(p_win = p_win, ev_each_fight = ev_each_fight, ev_each_yield = ev_each_yield)
+}
+
+# ============ core sim ============
+run_sim1B_exclusive <- function(
+  N = 60, G = 120, F = 60, gamma = 10,
+  yield_factor = 0.25,
+  mu_fs = 0.001, mu_sf = 0.001,
+  c_form_once = 0.00, c_status_once = 0.00,
+  init_p_status = 0.5,
+  seed = NULL
+) {
+  if (!is.null(seed)) set.seed(seed)
+
+  # fixed intrinsic strengths
+  s <- runif(N, min = 0.2, max = 1.0)
+
+  # initial strategies
+  strat <- ifelse(runif(N) < init_p_status, "status", "form")
+
+  # for metrics
+  attempt_count <- 0L
+  eligible_count <- 0L
+  total_bouts <- 0L
+
+  # fitness track
+  fit <- rep(0, N)
+
+  for (gen in seq_len(G)) {
+    fit[] <- 0
+
+    # one-time cognitive "setup" cost at gen 1
+    if (gen == 1) {
+      fit[strat == "form"]   <- fit[strat == "form"]   - c_form_once
+      fit[strat == "status"] <- fit[strat == "status"] - c_status_once
+    }
+
+    for (b in seq_len(F)) {
+      total_bouts <- total_bouts + 1L
+
+      ids <- sample.int(N, 3)
+      st  <- strat[ids]
+      ss  <- s[ids]
+
+      # identify strongest (target)
+      tgt_pos <- which.max(ss)
+      tgt     <- ids[tgt_pos]
+      others  <- ids[-tgt_pos]
+
+      # status eligibility: need at least 2 statuses among the three
+      n_status <- sum(st == "status")
+      eligible <- (n_status >= 2)
+      if (eligible) eligible_count <- eligible_count + 1L
+
+      prize_awarded <- FALSE
+
+      if (eligible) {
+        # among status agents present, can we form a coalition vs tgt?
+        status_idxs <- ids[st == "status"]
+        # list all status pairs (within the trio)
+        pairs <- list()
+        if (length(status_idxs) >= 2) {
+          comb <- combn(status_idxs, 2, simplify = FALSE)
+          for (pr in comb) {
+            a <- pr[1]; b <- pr[2]
+            res <- .ev_coal(s[a], s[b], s[tgt], gamma, yield_factor)
+            # both must strictly prefer coalition over yielding alone
+            if (res$ev_each_fight > res$ev_each_yield) {
+              pairs <- c(pairs, list(list(a=a, b=b, p=res$p_win)))
+            }
+          }
+        }
+        if (length(pairs) > 0) {
+          # pick pair with highest win prob
+          attempt_count <- attempt_count + 1L
+          best_i <- which.max(vapply(pairs, function(pp) pp$p, numeric(1)))
+          a <- pairs[[best_i]]$a; b <- pairs[[best_i]]$b
+          p_win <- pairs[[best_i]]$p
+
+          if (runif(1) < p_win) {
+            # coalition wins: ONE prize, split
+            fit[a]   <- fit[a] + gamma/2
+            fit[b]   <- fit[b] + gamma/2
+            fit[tgt] <- fit[tgt] - gamma
+          } else {
+            # coalition loses -> treat as coordinated yield (nobody fights the prize this bout)
+            fit[a]   <- fit[a] - gamma * yield_factor / 2
+            fit[b]   <- fit[b] - gamma * yield_factor / 2
+            fit[tgt] <- fit[tgt] + gamma
+          }
+          prize_awarded <- TRUE
+        }
+      }
+
+      if (!prize_awarded) {
+        # no (acceptable) coalition formed -> SOLO decision with ONE prize
+        # challenger order among the two non-targets is random
+        ch_order <- sample(others, length(others), replace = FALSE)
+
+        # first challenger decides via EV gate; if fights, that resolves the prize
+        i <- ch_order[1]
+        solo <- .ev_solo(s[i], s[tgt], gamma, yield_factor)
+
+        if (solo$ev_fight > solo$ev_yield) {
+          # fight i vs tgt for the single prize
+          if (runif(1) < solo$p_win) {
+            fit[i]   <- fit[i] + gamma
+            fit[tgt] <- fit[tgt] - gamma
+          } else {
+            fit[i]   <- fit[i] - gamma
+            fit[tgt] <- fit[tgt] + gamma
+          }
+        } else {
+          # yield: strongest (tgt) gets prize without fight
+          fit[i]   <- fit[i] - gamma * yield_factor
+          fit[tgt] <- fit[tgt] + gamma
+        }
+        # second challenger sees the prize resolved this bout -> no further payouts
+      }
+    } # bouts
+
+    # reproduction proportional to nonnegative fitness
+    fit[fit < 0] <- 0
+    if (sum(fit) == 0) fit[] <- 1
+    parents <- sample.int(N, N, replace = TRUE, prob = fit)
+    strat <- strat[parents]
+    s     <- s[parents] # (optional: inherit strength; or keep s fixed if you prefer a purely cultural dynamic)
+
+    # mutation
+    flip_f <- (strat == "form")   & (runif(N) < mu_fs)
+    flip_s <- (strat == "status") & (runif(N) < mu_sf)
+    strat[flip_f] <- "status"
+    strat[flip_s] <- "form"
+  }
+
+  final <- table(strat)
+  p_form   <- if ("form"   %in% names(final)) as.numeric(final["form"])/N   else 0
+  p_status <- if ("status" %in% names(final)) as.numeric(final["status"])/N else 0
+
+  list(
+    final   = data.frame(gen = G, p_form = p_form, p_status = p_status),
+    metrics = data.frame(
+      attempt_rate  = attempt_count / total_bouts,
+      eligible_rate = eligible_count / total_bouts
+    )
+  )
+}
+
+# ============ sweep (exclusive) ============
+sweep_sim1B_exclusive <- function(
+  N = 60, G = 120, reps = 8,
+  gamma_vals    = c(5, 10, 20),
+  F_vals        = c(60, 100),
+  yield_vals    = c(0.10, 0.25, 0.50),
+  c_status_vals = c(0.00, 0.01, 0.02),
+  mu_fs = 0.001, mu_sf = 0.001,
+  init_p_status = 0.5,
+  seed = NULL
+) {
+  if (!is.null(seed)) set.seed(seed)
+
+  grid <- expand.grid(
+    N=N, G=G, F=F_vals, gamma=gamma_vals,
+    yield_factor=yield_vals,
+    c_form_once=0.00, c_status_once=c_status_vals,
+    mu_fs=mu_fs, mu_sf=mu_sf,
+    init_p_status=init_p_status,
+    stringsAsFactors = FALSE
+  )
+
+  total_jobs <- nrow(grid) * reps
+  cat(sprintf("Sim1B (exclusive) sweep: %d rows × %d reps = %d jobs\n",
+              nrow(grid), reps, total_jobs))
+
+  # simple progress bar
+  .tick <- function(k, total) {
+    width <- 40
+    done <- floor(width * k / total)
+    cat(sprintf("\r[%-*s] %3.0f%%", width, paste0(rep("=", done), collapse=""),
+                100*k/total))
+    if (k == total) cat("\n")
+  }
+
+  out <- vector("list", nrow(grid))
+  job <- 0L
+  for (i in seq_len(nrow(grid))) {
+    p <- grid[i, ]
+    reps_out <- vector("list", reps)
+    for (r in seq_len(reps)) {
+      job <- job + 1L
+      reps_out[[r]] <- tryCatch({
+        rs <- run_sim1B_exclusive(
+          N=p$N, G=p$G, F=p$F, gamma=p$gamma,
+          yield_factor=p$yield_factor,
+          mu_fs=p$mu_fs, mu_sf=p$mu_sf,
+          c_form_once=p$c_form_once, c_status_once=p$c_status_once,
+          init_p_status=p$init_p_status,
+          seed = 20000 + i*31 + r
+        )
+        data.frame(
+          mean_form   = rs$final$p_form,
+          mean_status = rs$final$p_status,
+          attempt_rate = rs$metrics$attempt_rate,
+          eligible_rate = rs$metrics$eligible_rate
+        )
+      }, error = function(e) {
+        data.frame(mean_form=NA_real_, mean_status=NA_real_,
+                   attempt_rate=NA_real_, eligible_rate=NA_real_)
+      })
+      .tick(job, total_jobs)
+    }
+    reps_df <- dplyr::bind_rows(reps_out)
+    out[[i]] <- cbind(
+      p,
+      mean_form          = mean(reps_df$mean_form,   na.rm=TRUE),
+      mean_status        = mean(reps_df$mean_status, na.rm=TRUE),
+      attempt_rate_avg   = mean(reps_df$attempt_rate,   na.rm=TRUE),
+      eligible_rate_avg  = mean(reps_df$eligible_rate,  na.rm=TRUE),
+      dominant = ifelse(mean(reps_df$mean_status, na.rm=TRUE) >
+                          mean(reps_df$mean_form, na.rm=TRUE), "status", "form"),
+      stat_advantage = mean(reps_df$mean_status, na.rm=TRUE) -
+                       mean(reps_df$mean_form,   na.rm=TRUE)
+    )
+  }
+  dplyr::bind_rows(out)
+}
+
+
+
+# =========================
+# QUICK DEMOS (fast)
+# =========================
+
+# A: small-stakes, high yield -> fewer coalitions -> form can survive
+set.seed(1)
+ex_A <- run_sim1B_exclusive(N=60, G=100, F=60, gamma=5,
+                            yield_factor=0.50,
+                            c_status_once=0.00,
+                            init_p_status=0.5, seed=1)
+print(ex_A$final); print(ex_A$metrics); tail(ex_A$traj, 5)
+
+# B: moderate stakes/bouts, moderate yield -> coalitions frequent -> status tends to win
+set.seed(2)
+ex_B <- run_sim1B_exclusive(N=60, G=100, F=100, gamma=10,
+                            yield_factor=0.25,
+                            c_status_once=0.01,
+                            init_p_status=0.5, seed=2)
+print(ex_B$final); print(ex_B$metrics); tail(ex_B$traj, 5)
+
+# C: high stakes, many bouts, low yield -> coalitions common -> status wins strongly
+set.seed(3)
+ex_C <- run_sim1B_exclusive(N=60, G=100, F=100, gamma=20,
+                            yield_factor=0.10,
+                            c_status_once=0.02,
+                            init_p_status=0.5, seed=3)
+print(ex_C$final); print(ex_C$metrics); tail(ex_C$traj, 5)
+
+# =========================
+# SMALL SWEEP + HEATMAP
+# =========================
+set.seed(42)
+df1B <- sweep_sim1B_exclusive(
+  N=60, G=120, reps=6,
+  gamma_vals=c(5,10,20),
+  F_vals=c(60,100),
+  yield_vals=c(0.10,0.25,0.50),
+  c_status_vals=c(0.00,0.01,0.02),
+  init_p_status=0.5
+)
+
+cat("\nSim1B (exclusive) — first rows:\n"); print(head(df1B, 10))
+
+df_plot <- df1B %>%
+  mutate(
+    gamma = factor(gamma),
+    F = factor(F),
+    yield_factor = factor(yield_factor),
+    c_status_once = factor(c_status_once)
+  )
+
+p <- ggplot(df_plot, aes(x = gamma, y = F, fill = stat_advantage)) +
+  geom_tile(color = "grey85") +
+  scale_fill_gradient2(low="blue", mid="white", high="red", midpoint=0,
+                       name="Status − Form") +
+  facet_grid(yield_factor ~ c_status_once, labeller = label_both) +
+  labs(
+    x = expression(gamma),
+    y = "Bouts per gen (F)",
+    title = "Sim 1B (status-exclusive coalitions): status advantage across stakes, bouts, yield, and one-time cost",
+    subtitle = "Only STATUS+STATUS pairs can coordinate; split 50/50; no per-bout costs"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid = element_blank(),
+        strip.text = element_text(face="bold"),
+        axis.text.x = element_text(angle=45, hjust=1))
+print(p)
+
+##
+
+# Save CSV for the run you just did
+#ts <- format(Sys.time(), "%Y%m%d_%H%M%S")
+#outfile <- sprintf("sim1B_exclusive_phase_%s.csv", ts)
+#readr::write_csv(df1B, outfile)
+#cat("Wrote:", outfile, "\n")
+
+# Heatmap: status advantage by gamma × F, faceted by yield_factor
+suppressPackageStartupMessages({library(dplyr); library(ggplot2)})
+
+df_plot <- df1B %>%
+  mutate(
+    gamma        = factor(gamma),
+    F            = factor(F),
+    yield_factor = factor(yield_factor, levels=sort(unique(yield_factor)))
+  )
+
+p <- ggplot(df_plot, aes(x=gamma, y=F, fill=stat_advantage)) +
+  geom_tile(color="grey85") +
+  scale_fill_gradient2(low="steelblue", mid="white", high="firebrick",
+                       midpoint=0, name="Status − Form") +
+  facet_wrap(~ yield_factor, nrow=1, labeller = labeller(yield_factor = function(z) paste0("yield=", z))) +
+  labs(title="Sim 1B (exclusive coalitions): status advantage",
+       subtitle="Only status agents can form coalitions; single prize per triad; EV-gated decisions",
+       x=expression(gamma), y="F (bouts/gen)") +
+  theme_minimal(base_size=13) +
+  theme(panel.grid=element_blank(),
+        strip.text=element_text(face="bold"))
+print(p)
+
+# Optional: sanity check panel showing how often coalitions are even possible/attempted
+p2 <- ggplot(df_plot, aes(x=gamma, y=F, fill=eligible_rate_avg)) +
+  geom_tile(color="grey85") +
+  scale_fill_viridis_c(name="Eligible rate\n(≥2 status in triad)") +
+  facet_wrap(~ yield_factor, nrow=1) +
+  labs(title="Coalition eligibility across conditions", x=expression(gamma), y="F") +
+  theme_minimal(base_size=13) + theme(panel.grid=element_blank())
+print(p2)
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

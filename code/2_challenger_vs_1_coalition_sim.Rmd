@@ -1,0 +1,243 @@
+---
+title: "2_vs_1_coalition"
+output: html_document
+date: "2025-07-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r coalition with yield}
+
+# sim_coalition2_vs1_pyield_stochastic_with_cost_scaling.R
+# ————————————————————————————————————————————————————————————
+# Two‐challenger vs one target ABM with:
+#   • probabilistic fight/win p = s_i / (s_i + s_j)
+#   • if fight: winner +γ (or +γ/2 if coalition) minus a cost c
+#   • cost of fighting scales with closeness:
+#       c = γ * (1 - |strength_self – strength_opp| / (strength_self + strength_opp))
+#   • if yield: yielder –½γ, opponent +γ (no fighting cost)
+#   • “stat” agents attempt coalition with probability coalition_prob
+#   • cognitive costs every bout: cost_form or cost_stat
+# ————————————————————————————————————————————————————————————
+
+library(parallel)
+library(dplyr)
+
+# 1) Core simulation
+run_coalition2_vs1 <- function(
+  N,
+  gamma,
+  F,
+  G,
+  cost_stat,
+  cost_form,
+  mu_fs           = 0.001,
+  mu_sf           = 0.001,
+  yield_factor    = 0.5,
+  coalition_prob  = 1.0
+) {
+  gamma_yield <- gamma * yield_factor
+  s <- runif(N)
+
+  pop <- data.frame(
+    strat   = sample(c("form","stat"), N, replace=TRUE),
+    fitness = 0,
+    stringsAsFactors = FALSE
+  )
+
+  traj <- data.frame(gen=0:G, form=NA, stat=NA)
+  rec <- function() {
+    t <- table(pop$strat)
+    c(
+      form = if("form" %in% names(t)) t["form"]/N else 0,
+      stat = if("stat" %in% names(t)) t["stat"]/N else 0
+    )
+  }
+  traj[1,2:3] <- rec()
+
+  for(gen in seq_len(G)) {
+    pop$fitness[] <- 0
+
+    for(bout in seq_len(F)) {
+      trio <- sample.int(N, 3)
+      strengths <- s[trio]
+      tgt <- trio[which.max(strengths)]
+      ch  <- setdiff(trio, tgt)
+      B <- ch[1]; C <- ch[2]
+
+      # cognitive costs for making a decision
+      pop$fitness[c(tgt,B,C)] <-
+        pop$fitness[c(tgt,B,C)] -
+        ifelse(pop$strat[c(tgt,B,C)]=="stat", cost_stat, cost_form)
+
+      # attempt coalition if both challengers are stat
+      if (pop$strat[B]=="stat" && pop$strat[C]=="stat" &&
+          runif(1) < coalition_prob) {
+
+        e_t <- s[tgt]
+        e_c <- s[B] + s[C]
+        p   <- e_c / (e_c + e_t)
+
+        if (runif(1) < p) {
+          # coalition wins: challengers split reward & share cost
+          cost_B <- gamma * (1 - abs(s[B] - e_t)/(s[B] + e_t))
+          cost_C <- gamma * (1 - abs(s[C] - e_t)/(s[C] + e_t))
+          pop$fitness[B]   <- pop$fitness[B]   + gamma/2 - cost_B/2
+          pop$fitness[C]   <- pop$fitness[C]   + gamma/2 - cost_C/2
+          # target loses full γ and pays its cost
+          cost_t <- gamma * (1 - abs(e_t - e_c)/(e_t + e_c))
+          pop$fitness[tgt] <- pop$fitness[tgt] - gamma - cost_t
+        } else {
+          # coalition yields: challengers lose ½γ, target gains γ
+          pop$fitness[c(B,C)] <- pop$fitness[c(B,C)] - gamma_yield
+          pop$fitness[tgt]    <- pop$fitness[tgt] + gamma
+        }
+
+      } else {
+        # no coalition: two separate duels against target
+        for(chall in c(B,C)) {
+          e_t  <- s[tgt]
+          e_c  <- s[chall]
+          p    <- e_c / (e_c + e_t)
+
+          if (runif(1) < p) {
+            # fight
+            cost_f <- gamma * (1 - abs(e_c - e_t)/(e_c + e_t))
+            pop$fitness[chall] <- pop$fitness[chall] + gamma/2 - cost_f/2
+            pop$fitness[tgt]   <- pop$fitness[tgt]   - gamma - cost_f
+          } else {
+            # yield
+            pop$fitness[chall] <- pop$fitness[chall] - gamma_yield
+            pop$fitness[tgt]   <- pop$fitness[tgt]   + gamma
+          }
+        }
+      }
+    }
+
+    # reproduction & mutation
+    pop$fitness[pop$fitness < 0] <- 0
+    if (sum(pop$fitness)==0) pop$fitness[] <- 1
+    parents <- sample.int(N, N, replace=TRUE, prob=pop$fitness)
+    pop <- pop[parents, , drop=FALSE]
+
+    # rare strategy switches
+    for(i in seq_len(N)) {
+      if (pop$strat[i]=="form" && runif(1) < mu_fs) pop$strat[i] <- "stat"
+      else if (pop$strat[i]=="stat" && runif(1) < mu_sf) pop$strat[i] <- "form"
+    }
+
+    traj[gen+1,2:3] <- rec()
+  }
+
+  traj
+}
+
+# 2) Wrapper to collect final frequencies
+one_run <- function(idx, grid) {
+  p <- grid[idx,]
+  t <- run_coalition2_vs1(
+    N              = p$N,
+    gamma          = p$gamma,
+    F              = p$F,
+    G              = p$G,
+    cost_stat      = p$cost_stat,
+    cost_form      = p$cost_form,
+    mu_fs          = p$mu_fs,
+    mu_sf          = p$mu_sf,
+    yield_factor   = p$yield_factor,
+    coalition_prob = p$coalition_prob
+  )
+  final <- t[nrow(t), c("form","stat")]
+  data.frame(idx=idx, form=final["form"], stat=final["stat"])
+}
+
+# 3) Parameter grid
+param_grid <- expand.grid(
+  N               = 50,
+  gamma           = c(5,10,20,50),
+  F               = c(50,100,200),
+  G               = 100,
+  cost_stat       = c(0.05,0.10),
+  cost_form       = c(0.01),
+  mu_fs           = 0.001,
+  mu_sf           = 0.001,
+  yield_factor    = 0.5,
+  coalition_prob  = c(1.0, 0.8),
+  stringsAsFactors=FALSE
+)
+
+n_reps <- 5
+
+# 4) Parallel sweep
+cl <- makeCluster(detectCores()-1)
+clusterEvalQ(cl, library(dplyr))
+clusterExport(cl, c("run_coalition2_vs1","one_run","param_grid","n_reps"))
+
+total <- nrow(param_grid) * n_reps
+pb    <- txtProgressBar(0, total, style=3)
+cnt   <- 0
+res   <- vector("list", nrow(param_grid))
+
+for(i in seq_len(nrow(param_grid))) {
+  idxs <- rep(i, n_reps)
+  out  <- parLapplyLB(cl, idxs, function(ii) one_run(ii, param_grid))
+  dfb  <- bind_rows(out)
+  res[[i]] <- cbind(
+    param_grid[i, , drop=FALSE],
+    mean_form = mean(dfb$form),
+    mean_stat = mean(dfb$stat)
+  )
+  cnt <- cnt + n_reps
+  setTxtProgressBar(pb, cnt)
+}
+
+stopCluster(cl)
+close(pb)
+
+# 5) Compile and inspect phase results
+phase_df <- bind_rows(res) %>%
+  mutate(dominant = ifelse(mean_stat > mean_form, "stat", "form"))
+
+print(phase_df)
+
+# Optional: visualize status advantage heatmap
+library(ggplot2)
+df <- phase_df %>%
+  mutate(
+    stat_advantage = mean_stat - mean_form,
+    gamma          = factor(gamma),
+    F              = factor(F),
+    coalition_prob = factor(coalition_prob)
+  )
+
+ggplot(df, aes(x = gamma, y = F, fill = stat_advantage)) +
+  geom_tile(color = "grey80") +
+  scale_fill_gradient2(low="blue", mid="white", high="red", midpoint=0,
+                       name="Stat – Form") +
+  facet_wrap(~ coalition_prob, ncol=2, labeller=label_both) +
+  labs(x="γ (stakes)", y="Fights per gen (F)",
+       title="Status Advantage by Coalition Reliability") +
+  theme_minimal(base_size=14) +
+  theme(panel.grid=element_blank(),
+        strip.text=element_text(face="bold"),
+        axis.text.x=element_text(angle=45,hjust=1))
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

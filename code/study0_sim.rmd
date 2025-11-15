@@ -1,0 +1,462 @@
+---
+title: "study 0 draft"
+output: html_document
+date: "2025-10-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+# ============================================================
+# Study 0 (minimal): Do divisibility OR harm-lottery make coalitions evolve?
+# Copy-paste this whole file into a fresh R session.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+
+# ---------- Core helpers ----------
+p_win <- function(sa, sb) {
+  sa <- pmax(sa, 1e-9); sb <- pmax(sb, 1e-9)
+  sa / (sa + sb)
+}
+
+# ---------- One generation of random disputes ----------
+# Only two levers:
+#   d        = divisibility of the resource (0..1). Solo winner gets d; in a 2v1, each member gets d/2.
+#   lottery  = coalition-only expected bonus per member (0..1)*lottery_gain, even when d=0.
+#              Interprets the "harm lottery"/injury randomness as creating expected retention for allies.
+N = 60
+pC = 0.10            # fraction coalition-capable
+rounds = 400
+d = 0.0               # divisibility
+lottery = 0.0         # strength of harm-lottery effect
+lottery_gain = 0.04   # per-member coalition-only bonus when they win
+c_cost = 0.02         # per-member organization cost (paid if coalition forms)
+strength_shape = 2
+  
+play_generation_simple <- function(
+  N = 60,
+  pC = 0.10,             # fraction coalition-capable
+  rounds = 400,
+  d = 0.0,               # divisibility
+  lottery = 0.0,         # strength of harm-lottery effect
+  lottery_gain = 0.04,   # per-member coalition-only bonus when they win
+  c_cost = 0.02,         # per-member organization cost (paid if coalition forms)
+  strength_shape = 2,    # Gamma(shape, rate=shape) -> mean ~1
+  seed = NULL
+){
+  if (!is.null(seed)) set.seed(seed)
+
+  types <- ifelse(runif(N) < pC, "C", "L")
+  stren <- rgamma(N, shape = strength_shape, rate = strength_shape) + 1e-6
+  payoff <- numeric(N)
+
+  # counters
+  coal_attempts <- 0L
+  coal_formed   <- 0L
+  coal_won      <- 0L
+
+  for (r in seq_len(rounds)) {
+    # pick disputants
+    ij <- sample.int(N, 2, replace = FALSE); i <- ij[1]; j <- ij[2]
+
+    # who can recruit?
+    recruiters <- integer(0)
+    if (types[i] == "C") recruiters <- c(recruiters, i)
+    if (types[j] == "C") recruiters <- c(recruiters, j)
+
+    formed <- FALSE
+    sideA <- i; sideB <- j
+    ally  <- NA_integer_
+    leader <- NA_integer_
+    recruiters
+    if (length(recruiters) > 0) {
+      leader <- sample(recruiters, 1) # this line is problematic
+      leader <- recruiters[sample(length(recruiters),1)] # this one should be right
+      opp <- if (leader == i) j else i
+
+      # candidate allies (must be C; cannot be the two focal)
+      pool <- setdiff(seq_len(N), c(i, j))
+      poolC <- pool[types[pool] == "C"]
+
+      if (length(poolC) > 0) {
+        ally <- sample(poolC, 1)
+
+        # EVs: solo vs coalition (both leader and ally must want it)
+        # immediate divisible payoff + coalition-only lottery bonus
+        Sa_solo <- stren[leader]
+        Sb_solo <- stren[opp]
+        p_solo  <- p_win(Sa_solo, Sb_solo)
+        ev_leader_solo <- p_solo * d
+
+        Sa_coal <- stren[leader] + stren[ally]
+        Sb_coal <- stren[opp]
+        p_coal  <- p_win(Sa_coal, Sb_coal)
+
+        per_member_win <- (d / 2) + lottery * lottery_gain
+        ev_leader_coal <- p_coal * per_member_win - c_cost
+
+        # ally compares coalition vs outside option (0 baseline)
+        # (same p_coal and per_member_win; pays the same org cost)
+        ev_ally_join <- p_coal * per_member_win - c_cost
+        
+        # 这一步记录结盟，还没有fight
+        if (ev_leader_coal > ev_leader_solo && ev_ally_join > 0) {
+          coal_attempts <- coal_attempts + 1L
+          formed <- TRUE
+          coal_formed <- coal_formed + 1L
+          sideA <- c(leader, ally)
+          sideB <- opp
+          # pay org cost when they form (win or lose)
+          payoff[leader] <- payoff[leader] - c_cost
+          payoff[ally]   <- payoff[ally]   - c_cost
+        }
+      }
+    }
+
+    # resolve contest
+    Sa <- if (formed) sum(stren[sideA]) else stren[sideA]
+    Sb <- stren[sideB]
+    if (runif(1) < p_win(Sa, Sb)) {
+      # A wins
+      if (formed) {
+        coal_won <- coal_won + 1L
+        gain_each <- (d / 2) + lottery * lottery_gain
+        payoff[sideA] <- payoff[sideA] + gain_each
+      } else {
+        payoff[sideA] <- payoff[sideA] + d
+      }
+    } else {
+      # B wins (always solo here)
+      payoff[sideB] <- payoff[sideB] + d
+    }
+  }
+
+  tibble(
+    id = seq_len(N),
+    type = types,
+    strength = stren,
+    payoff = payoff,
+    coal_attempts = coal_attempts,
+    coal_formed   = coal_formed,
+    coal_won      = coal_won
+  )
+}
+
+# ---------- Replicator across generations ----------
+run_study0_simple <- function(
+  N = 60, gens = 60, rounds = 400,
+  d = 0.0, lottery = 0.0, lottery_gain = 0.04,
+  c_cost = 0.02, pC0 = 0.10, mut = 0.005, seed = NULL
+){
+  if (!is.null(seed)) set.seed(seed)
+  pC <- pC0
+  out <- vector("list", gens)
+
+  for (g in seq_len(gens)) {
+    gen_res <- play_generation_simple(
+      N = N, pC = pC, rounds = rounds,
+      d = d, lottery = lottery, lottery_gain = lottery_gain,
+      c_cost = c_cost
+    )
+
+    # mean payoffs by type (robust even if one type is absent)
+    summ <- gen_res %>%
+      group_by(type) %>%
+      summarise(pi = mean(payoff), .groups = "drop") %>%
+      tidyr::complete(type = c("C","L"), fill = list(pi = 0))
+
+    piC <- summ$pi[summ$type == "C"]
+    piL <- summ$pi[summ$type == "L"]
+    sel_diff <- piC - piL
+
+    denom <- pC * piC + (1 - pC) * piL
+    if (is.finite(denom) && denom > 0) {
+      pC <- (pC * piC) / denom
+      # tiny mutation to avoid absorbing states
+      pC <- (1 - mut) * pC + mut * (1 - pC)
+      pC <- pmin(pmax(pC, 1e-6), 1 - 1e-6)
+    }
+
+    # contest stats (identical per row)
+    attempts <- unique(gen_res$coal_attempts)
+    formed   <- unique(gen_res$coal_formed)
+    won      <- unique(gen_res$coal_won)
+
+    out[[g]] <- tibble(
+      gen = g, pC = pC,
+      attempts_per_round = attempts / rounds,
+      formed_per_round   = formed   / rounds,
+      won_per_round      = won      / rounds,
+      d = d, lottery = lottery, lottery_gain = lottery_gain,
+      c_cost = c_cost, piC = piC, piL = piL, sel_diff = sel_diff
+    )
+  }
+
+  bind_rows(out)
+}
+
+# ---------- Convenience: quick view ----------
+inspect <- function(df, rounds = 400) {
+  df %>%
+    mutate(
+      attempts = round(attempts_per_round * rounds),
+      formed   = round(formed_per_round   * rounds),
+      convert  = ifelse(attempts > 0, formed / attempts, NA_real_)
+    ) %>%
+    select(gen, pC, attempts, formed, convert, piC, piL, sel_diff, d, lottery)
+}
+
+# =========================
+# CLEAN, CRISP DEMOS (add to bottom of your minimal script)
+# =========================
+
+# --- Divisibility-only (no lottery): clear emergence ---
+demo_div_crisp <- run_study0_simple(
+  d = 0.80, lottery = 0.0,
+  gens = 80, rounds = 800,
+  c_cost = 0.01,     # <- slightly cheaper to coordinate
+  pC0 = 0.10, seed = 21
+)
+cat("\n--- Divisibility-only (crisp): d=0.80, lottery=0.0, c_cost=0.01 ---\n")
+print(inspect(demo_div_crisp, rounds = 800) %>% dplyr::slice_tail(n = 8), n = Inf)
+
+# --- Lottery-only (d=0): clear emergence ---
+demo_lott_crisp <- run_study0_simple(
+  d = 0.00, lottery = 1.0, lottery_gain = 0.04,
+  gens = 80, rounds = 800,
+  c_cost = 0.02, pC0 = 0.10, seed = 22
+)
+cat("\n--- Lottery-only (crisp): d=0.00, lottery=1.0, lottery_gain=0.04 ---\n")
+print(inspect(demo_lott_crisp, rounds = 800) %>% dplyr::slice_tail(n = 8), n = Inf)
+
+# --- Small STABLE sweep (averages 5 reps; tail-mean selection gate) ---
+sweep_simple_stable <- function(
+  d_vals = c(0.00, 0.40, 0.60, 0.80),
+  L_vals = c(0.0, 1.0),
+  gens = 70, rounds = 700, lottery_gain = 0.04,
+  reps = 5, tail_k = 12, seed = 123,
+  c_cost = 0.01
+){
+  grid <- expand.grid(d = d_vals, lottery = L_vals, KEEP.OUT.ATTRS = FALSE)
+  rows <- vector("list", nrow(grid))
+  for (i in seq_len(nrow(grid))) {
+    d <- grid$d[i]; L <- grid$lottery[i]
+    finals <- numeric(reps); sel_last <- numeric(reps)
+    for (r in 1:reps) {
+      set.seed(seed + i*100 + r)
+      rs <- run_study0_simple(
+        d = d, lottery = L,
+        gens = gens, rounds = rounds,
+        lottery_gain = lottery_gain,
+        c_cost = c_cost
+      )
+      finals[r]   <- rs$pC[gens]
+      sel_last[r] <- mean(tail(rs$sel_diff, tail_k))
+    }
+    rows[[i]] <- tibble::tibble(
+      d = d, lottery = L,
+      pC_final_mean  = mean(finals),
+      pC_final_q25   = unname(quantile(finals, 0.25)),
+      pC_final_q75   = unname(quantile(finals, 0.75)),
+      sel_lastK_mean = mean(sel_last),
+      emerged = (pC_final_mean >= 0.50 & sel_lastK_mean > 0)
+    )
+  }
+  dplyr::bind_rows(rows) %>% dplyr::arrange(d, lottery)
+}
+
+cat("\n--- Stable sweep over (d, lottery) with reps & tail-selection ---\n")
+print(sweep_simple_stable(), n = Inf)
+
+
+# Optional quick plots (comment out if sending as plain code)
+ library(ggplot2)
+ p <- bind_rows(
+   demo_div  %>% mutate(series = "divisibility only"),
+   demo_lott %>% mutate(series = "harm lottery only")
+ ) %>%
+   ggplot(aes(gen, pC, color = series)) +
+   geom_line(size = 1) +
+   labs(title = "Coalition-capable share over generations",
+        y = "p(C)", x = "Generation", color = "") +
+   theme_minimal(base_size = 12)
+ print(p)
+```
+
+## A revised version based on Tooby et al.
+
+
+```{r pressure, echo=FALSE}
+
+play_generation_simple2 <- function(
+  N = 60,
+  pC = 0.10,             # fraction coalition-capable
+  rounds = 400,
+  d = 1,               # divisibility
+  reward = 1,
+  harm_prob = 0.35,
+  harm_cost = 0.08,
+  distance_factor = 0.5, # this reflects the 4th point of Tooby
+  c_cost = 0.02,         # per-member organization cost (paid if coalition forms)
+  strength_shape = 2,    # Gamma(shape, rate=shape) -> mean ~1
+  seed = NULL
+){
+  if (!is.null(seed)) set.seed(seed)
+
+  types <- ifelse(runif(N) < pC, "C", "L")
+  stren <- rgamma(N, shape = strength_shape, rate = strength_shape) + 1e-6
+  payoff <- numeric(N)
+
+  # counters
+  opp_opportunities <- 0L
+  
+  coal_attempts <- 0L
+  coal_formed   <- 0L
+  coal_won      <- 0L
+  
+  # injuries_A    <- 0L  # A get injured
+  # injuries_B    <- 0L
+  
+  # random injury
+  apply_injury <- function(ids){
+    payoff[ids] <- payoff[ids] - harm_cost
+  }
+
+  for (r in seq_len(rounds)) {
+    # pick disputants
+    ij <- sample.int(N, 2, replace = FALSE); i <- ij[1]; j <- ij[2]
+
+    # who can recruit?
+    recruiters <- integer(0)
+    if (types[i] == "C") recruiters <- c(recruiters, i)
+    if (types[j] == "C") recruiters <- c(recruiters, j)
+
+    formed <- FALSE
+    sideA <- i; sideB <- j
+    ally  <- NA_integer_
+    leader <- NA_integer_
+    recruiters
+    
+    if (length(recruiters) > 0) {
+      # randomly pick a leader if both are "c"
+      leader <- sample(recruiters, 1)
+      opp    <- if (leader == i) j else i
+
+      # candidate allies (must be C; cannot be the two focal)
+      pool <- setdiff(seq_len(N), c(i, j))
+      poolC <- pool[types[pool] == "C"]
+
+      if (length(poolC) > 0) {
+        # counter of coalitional proposal
+        opp_opportunities <- opp_opportunities + 1
+        ally <- sample(poolC, 1)
+
+        # EVs: solo vs coalition (both leader and ally must want it)
+        # immediate divisible payoff + coalition-only lottery bonus
+        Sa_solo <- stren[leader]
+        Sb_solo <- stren[opp]
+        p_solo  <- p_win(Sa_solo, Sb_solo)
+
+        Sa_coal <- stren[leader] + stren[ally]
+        Sb_coal <- stren[opp]
+        p_coal  <- p_win(Sa_coal, Sb_coal)
+        
+        # expected harm
+        ecost_solo <- harm_prob * harm_cost
+        ecost_coal <- distance_factor * harm_prob * harm_cost / 2
+        
+        # expected share
+        win_share_leader_EV <- reward * stren[leader] / (stren[leader] + stren[ally])
+        win_share_ally_EV <- reward * stren[ally] / (stren[leader] + stren[ally])
+        
+        # expected payoff
+        ev_leader_solo <- p_solo * reward - ecost_solo
+        ev_leader_coal <- p_coal * win_share_leader_EV - ecost_coal - c_cost
+        ev_ally_join   <- p_coal * win_share_ally_EV   - ecost_coal - c_cost
+        
+        if (ev_leader_coal > ev_leader_solo) {
+          coal_attempts <- coal_attempts + 1L
+        }
+
+        if (ev_leader_coal > ev_leader_solo && ev_ally_join > 0) {
+          formed <- TRUE
+          coal_formed <- coal_formed + 1L
+          sideA <- c(leader, ally)
+          sideB <- opp
+          # pay org cost when they form (win or lose)
+          payoff[leader] <- payoff[leader] - c_cost
+          payoff[ally]   <- payoff[ally]   - c_cost
+        }
+      }
+    }
+
+    # resolve contest
+    Sa <- if (formed) sum(stren[sideA]) else stren[sideA]
+    Sb <- stren[sideB]
+    if (runif(1) < p_win(Sa, Sb)) {
+      # A wins
+      if (formed) {
+        coal_won <- coal_won + 1L
+        # divisible or not
+        if (d == 1) {
+          # fully divisible: each ally gets reward / 2
+          payoff[sideA] <- payoff[sideA] + reward / 2
+        } else {
+          # indivisible: higher probability the reward goes to the stronger one
+          w1 <- stren[sideA[1]]
+          w2 <- stren[sideA[2]]
+          p_leader_gets <- w1/(w1+w2)  
+          
+          if (runif(1) < p_leader_gets) {
+            payoff[sideA[1]] <- payoff[sideA[1]] + reward 
+          } else {
+            payoff[sideA[2]] <- payoff[sideA[2]] + reward 
+          }
+        }
+      } else {
+        payoff[sideA] <- payoff[sideA] + reward
+      }
+    } else {
+      # B wins (always solo here)
+      payoff[sideB] <- payoff[sideB] + reward
+    }
+    
+    # sampling injuries
+    p_injury_A <- if (formed) distance_factor * harm_prob else harm_prob
+    if (runif(1) < p_injury_A) {
+      if (formed) {
+        victim <- sample(sideA, 1)
+        apply_injury(victim)
+      } else {
+        apply_injury(sideA)
+      }
+    }
+    
+    if (runif(1) < harm_prob) apply_injury(sideB)
+  }
+
+  tibble(
+    id = seq_len(N),
+    type = types,
+    strength = stren,
+    payoff = payoff,
+    coal_attempts = coal_attempts,
+    coal_formed   = coal_formed,
+    coal_won      = coal_won
+  )
+}
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

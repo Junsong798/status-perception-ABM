@@ -1,0 +1,385 @@
+# Descriptio
+
+# Author: Junsong Lu
+# Version: 2020-01-26
+
+# Libraries
+library(tidyverse)
+
+# Sources
+
+# Parameters
+
+# ============================================================================
+
+# Code
+
+## ================================
+## Sim 1 — Status from WTR + Katz
+## ================================
+## Two types:
+##   - "form": uses only raw strength (bandwagoning); may ignore alliances.
+##   - "status": tracks dyadic WTR + alliance-memory Katz centrality; proposes/joins coalitions.
+##
+## Key ideas:
+##   • Dyadic WTR Θ[i,j] ≈ "how much i values j's support" (0..1). (Status agents maintain & use it.)
+##   • Alliance memory W (decays each step) → Katz/Bonacich centrality x capturing “summonable backing”.
+##   • Scalar status_i = (1-katz_mix)*compress_WTR_i + katz_mix*norm01(Katz_i).
+##   • Coalition choice uses status_i and simple EVs (benefit vs. cost); bandwagoning vs. future-support.
+##   • Fitness accumulates from wins; one-time cognitive cost for status each generation.
+##
+## Output:
+##   - time series of type shares
+##   - summary row per run
+##   - simple sweep helper
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+# normalize to 0-1
+norm01 <- function(x) {
+  if (!length(x)) return(x)
+  if (all(!is.finite(x))) return(rep(0, length(x)))
+  rng <- range(x[is.finite(x)], na.rm = TRUE)
+  if (diff(rng) < 1e-12) return(rep(0.5, length(x)))
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+
+# clip the value to 0 - 1 
+clip01 <- function(x) pmin(1, pmax(0, x))
+
+# Decayed alliance memory; add `pairs` that allied this step
+# 这一步就是设置关系矩阵，然后加入遗忘，然后把这一轮新的ally加入进来
+update_alliance_matrix <- function(W, pairs, decay = 0.97, weight = 1) {
+  W <- W * decay
+  if (!is.null(pairs) && nrow(pairs) > 0) {
+    for (k in seq_len(nrow(pairs))) {
+      i <- pairs[k, 1]; j <- pairs[k, 2]
+      if (i != j) {
+        W[i, j] <- W[i, j] + weight
+        W[j, i] <- W[j, i] + weight
+      }
+    }
+  }
+  diag(W) <- 0
+  W
+}
+
+# Katz/Bonacich (classic Katz with exogenous ones vector)
+# Computes Katz centrality — a network measure of “summonable support”
+katz_from_W <- function(W, beta = NULL) {
+  n <- nrow(W); if (n == 0) return(numeric())
+  W <- (W + t(W))/2; diag(W) <- 0
+  ev  <- suppressWarnings(eigen(W, only.values = TRUE)$values)
+  rho <- max(Re(ev), 0)
+  if (is.null(beta)) {
+    beta <- if (rho > 0) 0.9 / rho else 0
+  } else if (rho > 0 && beta >= 1/rho) {
+    beta <- 0.9 / rho
+  }
+  I <- diag(n); ones <- rep(1, n)
+  x <- tryCatch(
+    as.numeric(solve(I - beta * W, ones)),
+    error = function(e) {
+      # truncated power series fallback
+      acc  <- ones
+      term <- ones
+      for (k in 1:20) {
+        term <- beta * (W %*% term)
+        acc  <- acc + term
+      }
+      as.numeric(acc)
+    }
+  )
+  x
+}
+
+# Soft probability a side wins given strength S (logistic on strength diff)
+p_win <- function(Sa, Sb, k = 2.0) {
+  1 / (1 + exp(-k * (Sa - Sb)))
+}
+
+# Draw two distinct indices
+# 从n个人里面选择两个，这个假设可以修改，因为社会竞争往往不是随机的
+# 而是相近的人
+two_distinct <- function(n) {
+  i <- sample.int(n, 1)
+  j <- sample(c(seq_len(n)[-i]), 1)
+  c(i, j)
+}
+
+two_distinct(50)
+
+run_sim1 <- function(
+    # population & timing
+  N = 60, G = 120, F = 100,                 # N agents; G bouts per generation; F generations
+  # strengths ("form")
+  strength_mean = 1.0, strength_sd = 0.2,   # base strength noise (nonnegative)
+  # payoffs
+  benefit_win = 1.0, cost_lose = 0.5,       # winner benefit; loser cost
+  ally_share  = 0.5,                        # ally’s share of winner benefit (leader keeps 1-ally_share)
+  cost_join   = 0.05,                       # per-bout cost to join as ally
+  # strategy/cognition
+  init_p_status = 0.5,                      # initial share of status agents
+  allow_form_join   = TRUE,                # allow "form" types to join coalitions?
+  allow_form_propose= TRUE,                # allow "form" types to propose coalitions?
+  c_status_once = 0.02,                     # per-generation cognitive cost for status (applied once)
+  # learning (dyadic WTR)
+  wtr_init = 0.5,                           # initial dyadic valuation
+  wtr_lr_win = 0.10,                        # learning rate when helped/won together
+  wtr_lr_betray = 0.05,                     # learning rate when asked but not helped
+  wtr_lr_cost = 0.02,                       # when fought together but lost
+  # bandwagon vs future support in join decision
+  bw_weight  = 1.0,                         # bandwagon (immediate EV) weight
+  fs_weight  = 0.5,                         # future-support (WTR-difference) weight
+  # Katz / alliance memory
+  use_katz   = TRUE,
+  katz_decay = 0.97,
+  katz_beta  = NULL,                        # NULL => auto-safe
+  katz_mix   = 0.3,                         # 0=ignore Katz; 1=only Katz for status
+  # evolution
+  mu_fs = 0.001,                            # form -> status mutation per offspring
+  mu_sf = 0.001,                            # status -> form mutation per offspring
+  # RNG
+  seed = NULL,
+  verbose = FALSE
+) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  # --- init population ---
+  type <- ifelse(runif(N) < init_p_status, "status", "form")
+  strength_raw <- pmax(0, rnorm(N, mean = strength_mean, sd = strength_sd))
+  strength <- strength_raw
+  
+  # Dyadic WTR matrix (as others→me valuation; Θ[i,j] = how much i values j)
+  WTR <- matrix(wtr_init, N, N); diag(WTR) <- 0
+  
+  # Alliance memory + Katz
+  W_allies <- matrix(0, N, N)
+  katz_vec <- rep(0, N)
+  
+  # Status compression from WTR: mean inbound valuation (others value me)
+  compress_status_from_WTR <- function(WTR) {
+    s <- colMeans(WTR, na.rm = TRUE)
+    norm01(s)
+  }
+  
+  # Read status for decision: blend WTR-compressed and Katz
+  status_for_decision <- function(old_status, katz_vec, mix = katz_mix) {
+    if (!use_katz || mix <= 0) return(old_status)
+    s_old <- norm01(old_status)
+    s_kz  <- norm01(katz_vec)
+    (1 - mix) * s_old + mix * s_kz
+  }
+  
+  # Evolution recorder
+  rec <- matrix(NA_real_, nrow = F, ncol = 3)
+  colnames(rec) <- c("gen","p_form","p_status")
+  
+  # --- main generations loop ---
+  for (gen in seq_len(F)) {
+    fitness <- rep(0, N)
+    
+    # one-time cognitive cost to status
+    fitness[type == "status"] <- fitness[type == "status"] - c_status_once
+    
+    for (g in seq_len(G)) {
+      # pick two principals
+      ij <- two_distinct(N)
+      i <- ij[1]; j <- ij[2]
+      
+      # can principals recruit? (status by default; form only if allowed)
+      i_can_prop <- (type[i] == "status") || allow_form_propose
+      j_can_prop <- (type[j] == "status") || allow_form_propose
+      
+      # Compute baseline winning probabilities (no allies)
+      pi_0 <- p_win(strength[i], strength[j])
+      pj_0 <- 1 - pi_0
+      
+      # candidate pool excludes principals
+      candidates <- setdiff(seq_len(N), c(i, j))
+      
+      # status signals (updated within generation)
+      status_old <- compress_status_from_WTR(WTR)
+      if (use_katz) {
+        # recompute Katz occasionally (here: every bout; cheap for N<=200)
+        katz_vec <- katz_from_W(W_allies, beta = katz_beta)
+      }
+      status_sig <- status_for_decision(status_old, katz_vec, katz_mix)
+      
+      # Try to recruit ONE ally per side (greedy best-responder)
+      pick_ally <- function(leader, opponent, can_prop) {
+        if (!can_prop || length(candidates) == 0) return(NA_integer_)
+        # Evaluate each candidate's net EV of joining this side vs the other
+        # EV_k = bw_weight * (Δ p_win * benefit_share - cost_join)
+        #     + fs_weight * (WTR[leader,k] - WTR[opponent,k])
+        # Use current strengths + hypothetical joiner
+        Sc_opp <- strength[opponent]
+        Sc_lea <- strength[leader]
+        best_k <- NA_integer_
+        best_u <- -Inf
+        for (k in candidates) {
+          # If "form" cannot join, skip non-status candidates (unless allow_form_join)
+          k_can_join <- (type[k] == "status") || allow_form_join
+          if (!k_can_join) next
+          
+          # bandwagon diff: joining leader raises p_win for that side
+          p_lea_join <- p_win(Sc_lea + strength[k], Sc_opp)
+          p_opp_join <- p_win(Sc_opp + strength[k], Sc_lea)
+          # If candidate stayed neutral, we'll compare to not-join baseline.
+          # For simplicity we compare "join leader" vs "join opponent"
+          # (approx for a quick best side decision).
+          delta_p <- p_lea_join - (1 - p_opp_join)
+          
+          ev_bw <- delta_p * (benefit_win * ally_share) - cost_join
+          ev_fs <- (WTR[leader, k] - WTR[opponent, k])
+          u     <- bw_weight * ev_bw + fs_weight * ev_fs + 1e-9 * status_sig[k] # tie-break by status
+          
+          if (u > best_u) { best_u <- u; best_k <- k }
+        }
+        best_k
+      }
+      
+      ally_i <- pick_ally(i, j, i_can_prop)
+      # Remove chosen from pool when picking for the other side
+      if (!is.na(ally_i)) candidates <- setdiff(candidates, ally_i)
+      ally_j <- pick_ally(j, i, j_can_prop)
+      
+      # Strength totals
+      Si <- strength[i] + ifelse(is.na(ally_i), 0, strength[ally_i])
+      Sj <- strength[j] + ifelse(is.na(ally_j), 0, strength[ally_j])
+      
+      # Resolve contest
+      p_i <- p_win(Si, Sj)
+      win_i <- runif(1) < p_i
+      formed_pairs <- NULL
+      
+      if (win_i) {
+        # i's side wins
+        fitness[i] <- fitness[i] + benefit_win * (1 - ifelse(is.na(ally_i), 0, ally_share))
+        fitness[j] <- fitness[j] - cost_lose
+        if (!is.na(ally_i)) {
+          fitness[ally_i] <- fitness[ally_i] + benefit_win * ally_share - cost_join
+          formed_pairs <- rbind(formed_pairs, c(i, ally_i))
+        }
+        if (!is.na(ally_j)) {
+          fitness[ally_j] <- fitness[ally_j] - cost_join
+        }
+      } else {
+        # j's side wins
+        fitness[j] <- fitness[j] + benefit_win * (1 - ifelse(is.na(ally_j), 0, ally_share))
+        fitness[i] <- fitness[i] - cost_lose
+        if (!is.na(ally_j)) {
+          fitness[ally_j] <- fitness[ally_j] + benefit_win * ally_share - cost_join
+          formed_pairs <- rbind(formed_pairs, c(j, ally_j))
+        }
+        if (!is.na(ally_i)) {
+          fitness[ally_i] <- fitness[ally_i] - cost_join
+        }
+      }
+      
+      # --- Learning updates ---
+      # WTR updates:
+      #  • If allied with leader and won → increase mutual WTR (win credit)
+      #  • If allied and lost → small increase (loyalty) or small decrease; here: small decrease
+      #  • If leader asked (could propose) but candidate didn't join → decrease (betray)
+      if (win_i) {
+        if (!is.na(ally_i)) {
+          a <- i; b <- ally_i
+          WTR[a, b] <- clip01(WTR[a, b] + wtr_lr_win * (1 - WTR[a, b]))
+          WTR[b, a] <- clip01(WTR[b, a] + wtr_lr_win * (1 - WTR[b, a]))
+        }
+        if (!is.na(ally_j)) {
+          a <- j; b <- ally_j
+          # lost together
+          WTR[a, b] <- clip01(WTR[a, b] - wtr_lr_cost * (WTR[a, b]))
+          WTR[b, a] <- clip01(WTR[b, a] - wtr_lr_cost * (WTR[b, a]))
+        }
+        # betray on j's side (asked but got none)
+        if (j_can_prop && is.na(ally_j)) {
+          # penalize principal's WTR toward top non-joined candidate a bit
+          # (simple: toward the other principal)
+          WTR[j, i] <- clip01(WTR[j, i] - wtr_lr_betray * WTR[j, i])
+        }
+      } else {
+        if (!is.na(ally_j)) {
+          a <- j; b <- ally_j
+          WTR[a, b] <- clip01(WTR[a, b] + wtr_lr_win * (1 - WTR[a, b]))
+          WTR[b, a] <- clip01(WTR[b, a] + wtr_lr_win * (1 - WTR[b, a]))
+        }
+        if (!is.na(ally_i)) {
+          a <- i; b <- ally_i
+          WTR[a, b] <- clip01(WTR[a, b] - wtr_lr_cost * (WTR[a, b]))
+          WTR[b, a] <- clip01(WTR[b, a] - wtr_lr_cost * (WTR[b, a]))
+        }
+        if (i_can_prop && is.na(ally_i)) {
+          WTR[i, j] <- clip01(WTR[i, j] - wtr_lr_betray * WTR[i, j])
+        }
+      }
+      
+      # Alliance memory → Katz
+      if (use_katz) {
+        W_allies <- update_alliance_matrix(W_allies, formed_pairs, decay = katz_decay, weight = 1)
+        # Katz recomputed next bout at top (keeps it fresh)
+      }
+    } # end bouts
+    
+    # --- reproduction (fitness-proportionate with mutation) ---
+    # Avoid negative fitness: shift by min
+    fmin <- min(fitness)
+    if (fmin < 0) fitness <- fitness - fmin
+    # If all zero, give everyone epsilon to avoid degenerate sampling
+    if (sum(fitness) <= 1e-12) fitness <- rep(1, N)
+    
+    idx <- sample.int(N, size = N, replace = TRUE, prob = fitness)
+    # Inherit types with mutation
+    new_type <- type[idx]
+    mut_flip <- function(tp) {
+      if (tp == "form") {
+        if (runif(1) < mu_fs) "status" else "form"
+      } else {
+        if (runif(1) < mu_sf) "form" else "status"
+      }
+    }
+    new_type <- vapply(new_type, mut_flip, character(1))
+    
+    # Strength inheritance (weakly heritable here: parent + small noise)
+    strength <- pmax(0, strength[idx] + rnorm(N, 0, strength_sd * 0.1))
+    
+    type <- new_type
+    
+    # record
+    rec[gen, ] <- c(gen, mean(type == "form"), mean(type == "status"))
+  }
+  
+  rec_df <- as.data.frame(rec)
+  list(
+    traj = rec_df,
+    final = data.frame(
+      N = N, G = G, F = F,
+      init_p_status = init_p_status,
+      allow_form_join = allow_form_join,
+      allow_form_propose = allow_form_propose,
+      c_status_once = c_status_once,
+      katz_mix = katz_mix,
+      mean_form   = tail(rec_df$p_form, 1),
+      mean_status = tail(rec_df$p_status, 1),
+      dominant    = ifelse(tail(rec_df$p_status,1) > 0.5, "status", "form"),
+      stat_advantage = tail(rec_df$p_status,1) - tail(rec_df$p_form,1)
+    )
+  )
+}
+
+sim_out <- run_sim1()
+
+dat_traj <- as_tibble(sim_out$traj) %>%
+  pivot_longer(cols = -gen,
+               values_to = "proportion",
+               names_to = "phenotype")
+
+ggplot(dat_traj) +
+  geom_line(aes(gen, proportion, 
+                color = phenotype,
+                group = phenotype)) +
+  theme_bw()
